@@ -364,7 +364,8 @@ struct OpenClawIDNodeEnrollmentTests {
             }
             await #expect(throws: (any Error).self) { try await attempt() }
             #expect(await store.saved == nil)
-            let remembered = ["higher-binding", "stale", "excluded"].contains(scenario)
+            // J5: a snapshot naming an unverified binding_seq is K_gw's claim alone and is not kept.
+            let remembered = ["stale", "excluded"].contains(scenario)
             #expect(await store.observed?.snapshotSequence == (remembered ? 3 : nil))
             if remembered {
                 // This fresh-looking older snapshot was accepted before refused observations were retained.
@@ -405,8 +406,10 @@ struct OpenClawIDNodeEnrollmentTests {
                 for: Data("openclaw/\(type)/v1\0".utf8) + OpenClawIDCanonicalJSON.object(body).encoded)))
             return .object(fields)
         }
-        // The third attempt must not resurrect binding 4; the fourth must not roll membership back.
-        let evidence: [(Int64, Int64, Int64)] = [(4, 9, 5), (4, 10, 4), (4, 10, 4), (5, 9, 5)]
+        // Refused (lagging) evidence still records verified binding 5 and the newest membership order;
+        // a later snapshot older than that order is a replay. Retirement comes only from a verified
+        // binding, never a snapshot's claim (J5).
+        let evidence: [(Int64, Int64, Int64)] = [(5, 9, 4), (5, 10, 4), (5, 10, 4), (5, 8, 5)]
         for (index, values) in evidence.enumerated() {
             let (bindingSequence, sequence, snapshotBinding) = values
             var response = try #require(json["response"]).fields(["descriptor", "snapshot"])
@@ -430,6 +433,82 @@ struct OpenClawIDNodeEnrollmentTests {
             #expect(await store.observed?.snapshotBindingSequence == 5)
             #expect(await store.saved == nil)
         }
+    }
+
+    @Test func inflatedSnapshotIsRefusedUnkeptAndARebindUnderNewKeysIsDialed() throws {
+        let (fixture, json) = try fixture()
+        let root = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 42, count: 32))
+        let fingerprint = OpenClawIDNodeIdentity.hex(SHA256.hash(data: root.publicKey.rawRepresentation))
+        let original = try OpenClawIDNodeEnrollmentLink(fixture.node_invite.link)
+        let link = try OpenClawIDNodeEnrollmentLink(fixture.node_invite.link.replacingOccurrences(
+            of: String(original.rootFingerprint.dropFirst(3)), with: fingerprint))
+        let origin = try OpenClawIDNodeEnrollmentLink.discoveryOrigin("https://discovery.example")
+        let oldGateway = try Curve25519.Signing.PrivateKey(rawRepresentation:
+            OpenClawIDNodeIdentity.unhex(try #require(json["gateway_seed_hex"]).text()))
+        let newGateway = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 43, count: 32))
+        let base = try #require(json["response"]).fields(["descriptor", "snapshot"])
+        func signed(_ envelope: OpenClawIDCanonicalJSON, _ updates: [String: OpenClawIDCanonicalJSON],
+                    _ key: Curve25519.Signing.PrivateKey) throws -> OpenClawIDCanonicalJSON {
+            var fields = try envelope.fields(["v", "type", "body", "signer", "alg", "sig"])
+            guard case .object(var body) = fields["body"]! else { throw OpenClawIDNodeEnrollmentError.malformed }
+            body.merge(updates) { _, new in new }
+            fields["body"] = .object(body)
+            fields["signer"] = .string("ed25519:" + OpenClawIDNodeIdentity.hex(key.publicKey.rawRepresentation))
+            let type = try fields["type"]!.text()
+            fields["sig"] = .string(OpenClawIDNodeIdentity.base64URL(try key.signature(
+                for: Data("openclaw/\(type)/v1\0".utf8) + OpenClawIDCanonicalJSON.object(body).encoded)))
+            return .object(fields)
+        }
+        // Binding `binding` signed by R names `gateway`; the snapshot is signed by that K_gw.
+        func assess(binding: Int64, gateway: Curve25519.Signing.PrivateKey, seq: Int64, claims: Int64,
+                    previous: OpenClawIDNodeTrustState?, at now: Int64) throws -> OpenClawIDNodeTrustAssessment {
+            var response = base
+            var descriptor = try response["descriptor"]!.fields([
+                "v", "claw_id", "transport", "relay_url", "root_pub", "binding", "published_at",
+            ])
+            descriptor["root_pub"] = .string("ed25519:" + OpenClawIDNodeIdentity.hex(root.publicKey.rawRepresentation))
+            descriptor["binding"] = try signed(descriptor["binding"]!, ["binding_seq": .integer(binding),
+                "k_gw": .string("ed25519:" + OpenClawIDNodeIdentity.hex(gateway.publicKey.rawRepresentation))], root)
+            response["descriptor"] = .object(descriptor)
+            response["snapshot"] = try signed(response["snapshot"]!, ["seq": .integer(seq),
+                "binding_seq": .integer(claims), "issued_at": .integer(now)], gateway)
+            return try OpenClawIDNodeTrust.assess(response: OpenClawIDCanonicalJSON.object(response).encoded,
+                link: link, discoveryOrigin: origin, peerKey: fixture.node_key.iroh, previous: previous, now: now)
+        }
+        let admitted = try assess(binding: 1, gateway: oldGateway, seq: 7, claims: 1, previous: nil, at: fixture.now)
+        let state = try admitted.verdict.get().state
+        // The old K_gw alone signs binding_seq 9: refused, and nothing of it is kept.
+        let inflated = try assess(binding: 1, gateway: oldGateway, seq: 50, claims: 9, previous: state, at: fixture.now + 1)
+        #expect(throws: OpenClawIDNodeEnrollmentError.rollback) { try inflated.verdict.get() }
+        #expect(inflated.observation == state)
+        // R's binding 2 names a new K_gw whose order restarts below the old key's 7.
+        let rebound = try assess(binding: 2, gateway: newGateway, seq: 1, claims: 2,
+                                 previous: inflated.observation, at: fixture.now + 2)
+        let next = try rebound.verdict.get().state
+        #expect(next.bindingSequence == 2 && next.snapshotSequence == 1 && next.snapshotBindingSequence == 2)
+        try OpenClawIDNodeTrust.validateCommit(next, replacing: state)
+        // The retired binding is refused and does not move the marker back.
+        let retired = try assess(binding: 1, gateway: oldGateway, seq: 8, claims: 1, previous: next, at: fixture.now + 3)
+        #expect(throws: OpenClawIDNodeEnrollmentError.rollback) { try retired.verdict.get() }
+    }
+
+    @Test func nativeStoreLoadsAKeylessRowCappedAtThePinWithoutOrder() async throws {
+        let directory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("node-enrollment.sqlite")
+        let database = try OpenClawIDNodeStateSchema.open(databaseURL: url)
+        // A row without a key, whose snapshot binding 9 and seq 50 came from an inflated snapshot.
+        try database.execute("""
+        INSERT INTO openclaw_id_node_targets (hostname, claw_id, root_fingerprint, binding_sequence,
+          snapshot_sequence, snapshot_issued_at, snapshot_binding_sequence)
+        VALUES ('studio.example.test', '0123456789abcdef0123456789abcdef', 'fp:00', 1, 50, 100, 9)
+        """)
+        let store = OpenClawIDNodeNativeTrustStore(databaseURL: url, enrollmentID: UUID(), assertCurrent: {})
+        #expect(try await store.load(hostname: "studio.example.test") == .init(
+            clawID: "0123456789abcdef0123456789abcdef", rootFingerprint: "fp:00", bindingSequence: 1,
+            snapshotSequence: 0, snapshotIssuedAt: 0, snapshotBindingSequence: 1))
+        await store.close()
     }
 
     @Test func observationsMergeBySnapshotOrderAndDialCommitChecksCurrentRow() throws {
@@ -492,7 +571,8 @@ struct OpenClawIDNodeEnrollmentTests {
         for (owner, sequence, retirement) in [(reopened, Int64(9), Int64(5)), (other, Int64(10), Int64(4))] {
             try await owner.observe(hostname: link.hostname, state: .init(clawID: link.clawID,
                 rootFingerprint: link.rootFingerprint, bindingSequence: 4, snapshotSequence: sequence,
-                snapshotIssuedAt: fixture.now, snapshotBindingSequence: retirement))
+                snapshotIssuedAt: fixture.now, snapshotBindingSequence: retirement,
+                snapshotGatewayKey: target.state.snapshotGatewayKey))
         }
         await #expect(throws: OpenClawIDNodeEnrollmentError.rollback) { try await reopened.commit(target) }
         await reopened.close()
@@ -518,7 +598,7 @@ struct OpenClawIDNodeEnrollmentTests {
         var names: [String] = []
         while try columns.step() == .row { names.append(try columns.requiredText(at: 1, field: "column")) }
         #expect(names == ["hostname", "claw_id", "root_fingerprint", "binding_sequence", "snapshot_sequence",
-            "snapshot_issued_at", "snapshot_binding_sequence", "enrollment_id", "discovery_origin", "relay_url",
+            "snapshot_issued_at", "snapshot_binding_sequence", "snapshot_gateway_key", "enrollment_id", "discovery_origin", "relay_url",
             "server_key", "peer_key", "evidence_json"])
     }
 

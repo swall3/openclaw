@@ -14,6 +14,7 @@ public enum OpenClawIDNodeStateSchema {
       snapshot_sequence INTEGER NOT NULL,
       snapshot_issued_at INTEGER NOT NULL,
       snapshot_binding_sequence INTEGER NOT NULL,
+      snapshot_gateway_key TEXT,
       enrollment_id TEXT,
       discovery_origin TEXT,
       relay_url TEXT,

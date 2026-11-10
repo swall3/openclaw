@@ -217,7 +217,7 @@ import Testing
         for code in [Int64(0), 1, 2] {
             let endpoint = NodeClosedEndpoint(code: code)
             let tunnel = OpenClawIDNodeTunnel(
-                endpoint: endpoint, verifiedServerKey: String(repeating: "a", count: 64),
+                endpoint: endpoint, verifiedServerKey: { String(repeating: "a", count: 64) },
                 relayURL: URL(string: "https://relay.example/")!,
                 clock: OpenClawIDNodeClock(now: { 0 }, sleep: { _ in try await NodeTestWaiter<Void>().wait() }))
             let expected = code == 0 ? OpenClawIDNodeTransportError.closed : .removed
@@ -226,6 +226,23 @@ import Testing
             #expect(await endpoint.dials == (code == 0 ? 2 : 1))
             await tunnel.shutdown()
         }
+    }
+
+    @Test func everyRedialReverifiesTheServerKeyAndARefusalNeverDials() async throws {
+        let endpoint = NodeClosedEndpoint(code: 0)
+        let keys = NodeKeySequence(["iroh:" + String(repeating: "a", count: 64), "iroh:" + String(repeating: "b", count: 64)])
+        let tunnel = OpenClawIDNodeTunnel(
+            endpoint: endpoint, verifiedServerKey: { try await keys.next() },
+            relayURL: URL(string: "https://relay.example/")!,
+            clock: OpenClawIDNodeClock(now: { 0 }, sleep: { _ in }))
+        // The first dial is refused by the server; the redial follows the rotated, re-verified K_srv.
+        await #expect(throws: OpenClawIDNodeTransportError.closed) { try await tunnel.openStream() }
+        await #expect(throws: OpenClawIDNodeTransportError.closed) { try await tunnel.openStream() }
+        #expect(await endpoint.keys == ["iroh:" + String(repeating: "a", count: 64), "iroh:" + String(repeating: "b", count: 64)])
+        // Refused evidence (here: no more keys) fails the dial before the endpoint is touched.
+        await #expect(throws: OpenClawIDNodeEnrollmentError.rollback) { try await tunnel.openStream() }
+        #expect(await endpoint.dials == 2)
+        await tunnel.shutdown()
     }
 
     @Test func fullRangeCloseCodesAreNotNarrowedIntoRevocation() {
@@ -237,7 +254,7 @@ import Testing
 
     private func tunnel(_ endpoint: NodeTestEndpoint) -> OpenClawIDNodeTunnel {
         OpenClawIDNodeTunnel(
-            endpoint: endpoint, verifiedServerKey: String(repeating: "a", count: 64),
+            endpoint: endpoint, verifiedServerKey: { String(repeating: "a", count: 64) },
             relayURL: URL(string: "https://relay.example/")!,
             clock: OpenClawIDNodeClock(now: { 0 }, sleep: { duration in
                 if duration == .milliseconds(500) { return }
@@ -366,13 +383,24 @@ private actor NodeBlockedReadStream: OpenClawIDNodeStream {
 private actor NodeClosedEndpoint: OpenClawIDNodeEndpoint {
     let code: Int64
     var dials = 0
+    var keys: [String] = []
     init(code: Int64) { self.code = code }
     func connect(serverKey: String, relayURL: URL, alpn: Data) async throws -> any OpenClawIDNodeConnection {
         self.dials += 1
+        self.keys.append(serverKey)
         return NodeClosedConnection(code: self.code)
     }
     func relayStatus() async -> [OpenClawIDNodeRelayStatus] { [] }
     func shutdown() async {}
+}
+
+private actor NodeKeySequence {
+    var keys: [String]
+    init(_ keys: [String]) { self.keys = keys }
+    func next() throws -> String {
+        guard !self.keys.isEmpty else { throw OpenClawIDNodeEnrollmentError.rollback }
+        return self.keys.removeFirst()
+    }
 }
 
 private struct NodeClosedConnection: OpenClawIDNodeConnection {

@@ -143,13 +143,11 @@ public enum OpenClawIDNodeTrust {
         // A binding_seq beyond the verified binding is K_gw's claim alone: refused, and only the
         // verified binding's pin advance is kept (J5).
         if snapshotBinding > bindingSequence {
-            let pinned = previous.map { previous in
-                OpenClawIDNodeTrustState(clawID: previous.clawID, rootFingerprint: previous.rootFingerprint,
-                    bindingSequence: bindingSequence, snapshotSequence: previous.snapshotSequence,
-                    snapshotIssuedAt: previous.snapshotIssuedAt,
-                    snapshotBindingSequence: previous.snapshotBindingSequence,
-                    snapshotGatewayKey: previous.snapshotGatewayKey)
-            }
+            let pinned = OpenClawIDNodeTrustState(clawID: claw, rootFingerprint: rootFingerprint,
+                bindingSequence: bindingSequence, snapshotSequence: previous?.snapshotSequence ?? 0,
+                snapshotIssuedAt: previous?.snapshotIssuedAt ?? 0,
+                snapshotBindingSequence: previous?.snapshotBindingSequence ?? bindingSequence,
+                snapshotGatewayKey: previous?.snapshotGatewayKey)
             return .init(observation: pinned, verdict: .failure(.rollback))
         }
         let candidate = OpenClawIDNodeTrustState(clawID: claw, rootFingerprint: rootFingerprint,
